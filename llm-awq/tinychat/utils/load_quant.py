@@ -164,8 +164,29 @@ def load_awq_llama_fast(model, checkpoint, w_bit, group_size, device):
             if checkpoint.endswith(".safetensors"):
                 from safetensors.torch import load_file as safe_load
 
-                model.load_state_dict(safe_load(checkpoint))
+                state = safe_load(checkpoint)
             else:
-                model.load_state_dict(torch.load(checkpoint))
+                state = torch.load(checkpoint)
+
+            # Special handling for TinyChat Qwen2 wrapper (used for Qwen2-VL text backbone).
+            # The quantized checkpoint was created from the bare text model (keys like
+            # "embed_tokens.weight", "layers.0..."), while the TinyChat wrapper nests
+            # this under the attribute `model` (keys like "model.embed_tokens.weight", ...).
+            module_name = getattr(model.__class__, "__module__", "")
+            class_name = model.__class__.__name__
+            if "tinychat.models.qwen2" in module_name or class_name == "Qwen2ForCausalLM":
+                remapped = {}
+                for k, v in state.items():
+                    # Keep any lm_head.* keys top-level if they ever appear; everything
+                    # else is part of the inner text model and should be under `model.`.
+                    if k.startswith("lm_head."):
+                        remapped[k] = v
+                    else:
+                        remapped[f"model.{k}"] = v
+                state = remapped
+
+            # Allow missing keys such as lm_head.weight when the checkpoint only
+            # contains the language backbone weights.
+            model.load_state_dict(state, strict=False)
 
     return model.to(device)

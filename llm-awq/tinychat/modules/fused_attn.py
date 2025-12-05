@@ -14,7 +14,13 @@ from tinychat.models.llama import apply_rotary_emb
 import gc
 
 import tinychat.utils.constants
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn_func = None
+    HAS_FLASH_ATTN = False
+
 from tinychat.models.llama import LlamaAttentionFused
 from tinychat.models.qwen2 import Qwen2AttentionFused
 
@@ -546,7 +552,7 @@ class QuantLlamaAttentionFusedFlash(nn.Module):
         return self.o_proj(output)
 
 
-def make_quant_attn(model, dev, flash_attn=True):
+def make_quant_attn(model, dev, flash_attn=HAS_FLASH_ATTN):
     """
     Replace all LlamaAttention modules with QuantLlamaAttention modules, fusing the q, k, v projections.
     """

@@ -27,8 +27,12 @@ def get_named_linears(module):
 
 
 def get_blocks(model):
+    print("class name", model.__class__.__name__)
     if model.__class__.__name__ in ("LlamaForCausalLM", "Qwen2ForCausalLM"):
         layers = model.model.layers
+    elif model.__class__.__name__ == "Qwen2VLTextModel":
+        # For Qwen2-VL text backbone, the transformer layers live directly under `.layers`
+        layers = model.layers
     elif model.__class__.__name__ == "InternVL3":
         layers = model.language_model.model.layers
         # layers = [model.language_model.model.layers, model.vision_model.encoder.layers]
@@ -138,6 +142,13 @@ def run_awq(
         def __init__(self, module):
             super().__init__()
             self.module = module
+            # Preserve selected attributes from the wrapped module so that
+            # model forward passes that rely on them (e.g., Qwen2VLDecoderLayer
+            # using `attention_type`) continue to work even when the first
+            # layer is temporarily replaced by this Catcher.
+            for attr in ("attention_type",):
+                if hasattr(module, attr):
+                    setattr(self, attr, getattr(module, attr))
 
         def forward(self, inp, **kwargs):
             inps.append(inp)
@@ -192,7 +203,9 @@ def run_awq(
             )
         inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # get output as next layer's input
-        inps = layer(inps, **layer_kwargs)[0]
+        # print(inps.shape)
+        out = layer(inps, **layer_kwargs)
+        inps = out[0] if isinstance(out, tuple) else out
         for h in handles:
             h.remove()
         # now solve for scaling and clipping

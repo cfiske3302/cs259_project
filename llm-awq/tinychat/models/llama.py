@@ -18,7 +18,12 @@ import tinychat.utils.constants
 max_batch_size = tinychat.utils.constants.max_batch_size
 multiple_of = tinychat.utils.constants.llama_multiple_of
 max_seq_len = tinychat.utils.constants.max_seq_len
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn_func = None
+    HAS_FLASH_ATTN = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -215,13 +220,39 @@ class LlamaAttentionFused(nn.Module):
             else:
                 keys = xk
                 values = xv
-            output = flash_attn_func(
-                q=xq,
-                k=keys,
-                v=values,
-                causal=True,
-            )
-            output = output.contiguous().view(bsz, seqlen, -1)
+
+            if HAS_FLASH_ATTN and flash_attn_func is not None:
+                output = flash_attn_func(
+                    q=xq,
+                    k=keys,
+                    v=values,
+                    causal=True,
+                )
+                output = output.contiguous().view(bsz, seqlen, -1)
+            else:
+                # Fallback to standard scaled dot-product attention if flash_attn is unavailable
+                keys = torch.repeat_interleave(
+                    keys, dim=2, repeats=self.num_key_value_groups
+                )
+                values = torch.repeat_interleave(
+                    values, dim=2, repeats=self.num_key_value_groups
+                )
+
+                xq_ = xq.transpose(1, 2)
+                keys_ = keys.transpose(1, 2)
+                values_ = values.transpose(1, 2)
+                scores = torch.matmul(xq_, keys_.transpose(2, 3)) / math.sqrt(
+                    self.head_dim
+                )
+                if mask is not None:
+                    scores = scores + mask
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq_)
+                output = torch.matmul(scores, values_)
+                output = (
+                    output.transpose(1, 2)
+                    .contiguous()
+                    .view(bsz, seqlen, -1)
+                )
         else:
             xq = xq.view(bsz, self.n_local_heads, self.head_dim)
             xk = xk.view(bsz, self.num_key_value_heads, self.head_dim)

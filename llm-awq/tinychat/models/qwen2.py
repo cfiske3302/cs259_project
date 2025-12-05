@@ -17,7 +17,12 @@ import time
 from tqdm import tqdm
 from transformers import GenerationMixin
 from transformers.models.qwen2 import Qwen2ForCausalLM
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn_func = None
+    HAS_FLASH_ATTN = False
 
 max_batch_size = tinychat.utils.constants.max_batch_size
 max_seq_len = tinychat.utils.constants.max_seq_len
@@ -249,13 +254,36 @@ class Qwen2AttentionFused(nn.Module):
             else:
                 keys = xk
                 values = xv
-            output = flash_attn_func(
-                q=xq,
-                k=keys,
-                v=values,
-                causal=True,
-            )
-            output = output.contiguous().view(bsz, seqlen, -1)
+
+            if HAS_FLASH_ATTN and flash_attn_func is not None:
+                output = flash_attn_func(
+                    q=xq,
+                    k=keys,
+                    v=values,
+                    causal=True,
+                )
+                output = output.contiguous().view(bsz, seqlen, -1)
+            else:
+                # Fallback to standard scaled dot-product attention if flash_attn is unavailable
+                # Expand key/value heads to full attention heads, then use PyTorch SDPA
+                keys = keys.permute(0, 2, 1, 3)  # [bsz, num_kv_heads, seqlen, head_dim]
+                values = values.permute(0, 2, 1, 3)
+                keys = repeat_kv(keys, self.num_key_value_groups)
+                values = repeat_kv(values, self.num_key_value_groups)
+
+                q = xq.transpose(1, 2)  # [bsz, num_heads, seqlen, head_dim]
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    keys,
+                    values,
+                    attn_mask=mask,
+                    is_causal=self.is_causal,
+                )
+                output = (
+                    output.transpose(1, 2)
+                    .contiguous()
+                    .view(bsz, seqlen, -1)
+                )
         else:
             xq = query_states.view(bsz, self.num_heads, self.head_dim)
             xk = key_states.view(bsz, self.num_key_value_heads, self.head_dim)
@@ -340,11 +368,24 @@ class Qwen2Model(nn.Module):
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Note (Haotian): rope_theta has to be defined here, otherwise context stage is wrong.
-        rope_scale = config.rope_scaling
-        if rope_scale is None:
+        # Handle different rope_scaling schemas across Qwen2/Qwen2-VL variants
+        rope_scale_cfg = config.rope_scaling
+        print(rope_scale_cfg)
+        if rope_scale_cfg is None:
             rope_scale = 1.0
+        elif isinstance(rope_scale_cfg, dict):
+            # Newer configs may use {"type": ..., "factor": ...} or
+            # {"type": ..., "short_factor": ..., "long_factor": ...}.
+            if "factor" in rope_scale_cfg:
+                factor = rope_scale_cfg["factor"]
+            else:
+                # Fallback: prefer short_factor if present, otherwise long_factor, else 1.0
+                factor = rope_scale_cfg.get("short_factor", rope_scale_cfg.get("long_factor", 1.0))
+            rope_scale = 1.0 / float(factor)
         else:
-            rope_scale = 1.0 / rope_scale["factor"]
+            # If rope_scaling is already a numeric value
+            rope_scale = 1.0 / float(rope_scale_cfg)
+
         self.freqs = precompute_freqs(
             config.hidden_size // config.num_attention_heads,
             config.max_position_embeddings * 2,
